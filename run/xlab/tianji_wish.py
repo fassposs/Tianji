@@ -25,9 +25,9 @@ from modelscope import snapshot_download
 logger = logging.get_logger(__name__)
 
 # 提前下载模型
-model_path = './tianji-wish'
-os.system(f'git clone https://code.openxlab.org.cn/sanbuphy/tianji-wish-internlm2-7b.git {model_path}')
-os.system(f'cd {model_path} && git lfs pull')
+model_path = "./huggingface/internlm/internlm2-7b"
+# os.system(f'git clone https://code.openxlab.org.cn/sanbuphy/tianji-wish-internlm2-7b.git {model_path}')
+# os.system(f'cd {model_path} && git lfs pull')
 
 @dataclass
 class GenerationConfig:
@@ -51,10 +51,11 @@ def generate_interactive(
     additional_eos_token_id: Optional[int] = None,
     **kwargs,
 ):
+    useDevice = "cuda" if torch.cuda.is_available() else "cpu"
     inputs = tokenizer([prompt], padding=True, return_tensors="pt")
     input_length = len(inputs["input_ids"][0])
     for k, v in inputs.items():
-        inputs[k] = v.cuda()
+        inputs[k] = v.to(useDevice)
     input_ids = inputs["input_ids"]
     batch_size, input_ids_seq_length = (
         input_ids.shape[0],
@@ -177,10 +178,11 @@ def on_btn_click():
 
 @st.cache_resource
 def load_model():
+    useDevice = "cuda" if torch.cuda.is_available() else "cpu"
     model = (
         AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
         .to(torch.bfloat16)
-        .cuda()
+        .to(useDevice).eval()
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     return model, tokenizer

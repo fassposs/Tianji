@@ -25,7 +25,7 @@ from modelscope import snapshot_download
 logger = logging.get_logger(__name__)
 
 # 提前下载模型
-model_path = './modelscope/Shanghai_AI_Laboratory/internlm2-chat-7b'
+model_path = "./huggingface/internlm/internlm2-7b"
 # os.system(f'git clone https://code.openxlab.org.cn/sanbuphy/tianji-etiquette-internlm2-7b.git {model_path}')
 # os.system(f'cd {model_path} && git lfs pull')
 
@@ -51,19 +51,47 @@ def generate_interactive(
     additional_eos_token_id: Optional[int] = None,
     **kwargs,
 ):
+    """
+    使用给定模型和分词器交互式地生成文本。该函数通过逐步解码的方式生成输出，并在每次生成新token后立即返回当前结果，
+    支持流式响应。
+
+    参数:
+        model: 预训练的语言模型。
+        tokenizer: 对应于模型的分词器。
+        prompt (str): 输入提示文本，用于引导生成过程。
+        generation_config (Optional[GenerationConfig]): 控制生成行为的配置对象（如最大长度、采样策略等）。
+        logits_processor (Optional[LogitsProcessorList]): 用于处理logits的处理器列表。
+        stopping_criteria (Optional[StoppingCriteriaList]): 判断是否停止生成的标准列表。
+        prefix_allowed_tokens_fn (Optional[Callable[[int, torch.Tensor], List[int]]]):
+            允许前缀tokens的函数，用于限制生成词汇。
+        additional_eos_token_id (Optional[int]): 额外指定的结束符ID，在检测到时也会终止生成。
+        **kwargs: 其他传递给generation_config的参数。
+
+    返回:
+        Generator[str]: 每次yield一个字符串形式的部分生成结果。
+    """
+    # 判断是使用cpu还是gpu
+    useDevice = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 将输入提示文本进行编码并移至GPU设备
     inputs = tokenizer([prompt], padding=True, return_tensors="pt")
     input_length = len(inputs["input_ids"][0])
     for k, v in inputs.items():
-        inputs[k] = v.cuda()
+        inputs[k] = v.to(useDevice)
+        # inputs[k] = v.cuda()
     input_ids = inputs["input_ids"]
     batch_size, input_ids_seq_length = (
         input_ids.shape[0],
         input_ids.shape[-1],
     )  # noqa: F841  # pylint: disable=W0612
+
+    # 若未提供generation_config则使用模型默认配置，并更新相关参数
     if generation_config is None:
         generation_config = model.generation_config
     generation_config = copy.deepcopy(generation_config)
     model_kwargs = generation_config.update(**kwargs)
+
+    # 获取开始与结束标记ID，并根据需要扩展结束标记集合
     bos_token_id, eos_token_id = (  # noqa: F841  # pylint: disable=W0612
         generation_config.bos_token_id,
         generation_config.eos_token_id,
@@ -72,12 +100,14 @@ def generate_interactive(
         eos_token_id = [eos_token_id]
     if additional_eos_token_id is not None:
         eos_token_id.append(additional_eos_token_id)
+
+    # 处理max_length和max_new_tokens之间的兼容性警告
     has_default_max_length = (
         kwargs.get("max_length") is None and generation_config.max_length is not None
     )
     if has_default_max_length and generation_config.max_new_tokens is None:
         warnings.warn(
-            f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
+            f"Using [max_length](file://d:\workspace\vmshareroom\python_project\TianJi\tianji\finetune\xtuner\internlm2_chat_7b_full_finetune.py#L49-L49)'s default ({generation_config.max_length}) to control the generation length. "
             "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
             " recommend using `max_new_tokens` to control the maximum length of the generation.",
             UserWarning,
@@ -88,22 +118,23 @@ def generate_interactive(
         )
         if not has_default_max_length:
             logger.warn(  # pylint: disable=W4902
-                f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
+                f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and [max_length](file://d:\workspace\vmshareroom\python_project\TianJi\tianji\finetune\xtuner\internlm2_chat_7b_full_finetune.py#L49-L49)(="
                 f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
                 "Please refer to the documentation for more information. "
                 "(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)",
                 UserWarning,
             )
 
+    # 警告：如果输入序列已经超过了设定的最大长度
     if input_ids_seq_length >= generation_config.max_length:
         input_ids_string = "input_ids"
         logger.warning(
-            f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
+            f"Input length of {input_ids_string} is {input_ids_seq_length}, but [max_length](file://d:\workspace\vmshareroom\python_project\TianJi\tianji\finetune\xtuner\internlm2_chat_7b_full_finetune.py#L49-L49) is set to"
             f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
             " increasing `max_new_tokens`."
         )
 
-    # 2. Set generation parameters if not already defined
+    # 初始化logits处理器和停止条件判断器
     logits_processor = (
         logits_processor if logits_processor is not None else LogitsProcessorList()
     )
@@ -124,11 +155,14 @@ def generate_interactive(
     )
     logits_warper = model._get_logits_warper(generation_config)
 
+    # 初始化未完成序列状态及得分记录变量
     unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
     scores = None
+
+    # 循环生成下一个token直到满足停止条件
     while True:
         model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-        # forward pass to get next token
+        # 前向传播获取下一token的概率分布
         outputs = model(
             **model_inputs,
             return_dict=True,
@@ -138,26 +172,29 @@ def generate_interactive(
 
         next_token_logits = outputs.logits[:, -1, :]
 
-        # pre-process distribution
+        # 应用logits处理器和warper调整概率分布
         next_token_scores = logits_processor(input_ids, next_token_logits)
         next_token_scores = logits_warper(input_ids, next_token_scores)
 
-        # sample
+        # 根据do_sample决定是采样还是贪婪选择最高概率token
         probs = nn.functional.softmax(next_token_scores, dim=-1)
         if generation_config.do_sample:
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
         else:
             next_tokens = torch.argmax(probs, dim=-1)
 
-        # update generated ids, model inputs, and length for next step
+        # 更新已生成的token ID序列以及模型输入参数
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         model_kwargs = model._update_model_kwargs_for_generation(
             outputs, model_kwargs, is_encoder_decoder=False
         )
+
+        # 更新未完成序列的状态（若遇到EOS token则标记为已完成）
         unfinished_sequences = unfinished_sequences.mul(
             (min(next_tokens != i for i in eos_token_id)).long()
         )
 
+        # 解码当前生成的结果并去除可能存在的EOS token
         output_token_ids = input_ids[0].cpu().tolist()
         output_token_ids = output_token_ids[input_length:]
         for each_eos_token_id in eos_token_id:
@@ -165,8 +202,10 @@ def generate_interactive(
                 output_token_ids = output_token_ids[:-1]
         response = tokenizer.decode(output_token_ids)
 
+        # 实时返回部分生成结果
         yield response
-        # stop when each sentence is finished, or if we exceed the maximum length
+
+        # 当所有句子都已完成或达到最大长度时退出循环
         if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
             break
 
@@ -177,10 +216,15 @@ def on_btn_click():
 
 @st.cache_resource
 def load_model():
+    # 判断是使用cpu还是gpu
+    useDevice = "cuda" if torch.cuda.is_available() else "cpu"
     model = (
         AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
         .to(torch.bfloat16)
-        .cuda()
+        .to(useDevice).eval()
+        # .cuda()
+
+        # .to(useDevice).eval()
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     return model, tokenizer
